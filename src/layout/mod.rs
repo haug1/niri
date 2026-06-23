@@ -755,7 +755,7 @@ impl<W: LayoutElement> Layout<W> {
             .expect("there must always be a free global workspace index")
     }
 
-    fn next_free_global_workspace_index_from(&self, start: usize) -> usize {
+    fn smallest_free_global_index_from(&self, start: usize) -> usize {
         let used: HashSet<_> = self.global_workspace_idxs.values().copied().collect();
 
         (start.max(1)..)
@@ -763,12 +763,10 @@ impl<W: LayoutElement> Layout<W> {
             .expect("there must always be a free global workspace index")
     }
 
-    fn previous_free_global_workspace_index_from(&self, start: usize) -> Option<usize> {
+    fn largest_free_global_index_below(&self, current: usize) -> Option<usize> {
         let used: HashSet<_> = self.global_workspace_idxs.values().copied().collect();
 
-        (1..start.max(1))
-            .rev()
-            .find(|candidate| !used.contains(candidate))
+        (1..current).rev().find(|candidate| !used.contains(candidate))
     }
 
     fn refresh_global_workspace_indices(&mut self) {
@@ -977,77 +975,97 @@ impl<W: LayoutElement> Layout<W> {
             .copied()
     }
 
-    fn previous_global_workspace_index_on_output(&mut self, output: &Output) -> Option<usize> {
-        self.refresh_global_workspace_indices();
+    /// Active workspace on `output` holds windows or has a name (i.e. is worth keeping).
+    fn active_workspace_has_content_on_output(&self, output: &Output) -> bool {
+        self.monitor_for_output(output)
+            .map(|monitor| monitor.workspaces[monitor.active_workspace_idx].has_windows_or_name())
+            .unwrap_or(false)
+    }
 
-        let current = self.workspace_global_index_on_output(output)?;
+    /// Finds the next global index below `current` ("down", i.e. a higher number) that is reachable
+    /// from `output`: either an existing workspace on this output, or a free index that can be
+    /// created here. Indices taken by other outputs are skipped. Creating a brand-new workspace
+    /// past the last one on this output only happens when `allow_new_bottom` is set, to avoid
+    /// spawning an endless chain of empty workspaces.
+    fn step_global_index_down(
+        &self,
+        output: &Output,
+        current: usize,
+        allow_new_bottom: bool,
+    ) -> Option<usize> {
         let monitor = self.monitor_for_output(output)?;
+        let next_on_output = monitor
+            .workspaces
+            .iter()
+            .filter_map(|ws| self.global_workspace_idxs.get(&ws.id()).copied())
+            .filter(|idx| *idx > current)
+            .min();
+        let next_free = self.smallest_free_global_index_from(current + 1);
 
-        monitor
+        match next_on_output {
+            // An existing workspace on this output is the immediately following slot.
+            Some(existing) if existing < next_free => Some(existing),
+            // Fill the gap before a workspace that exists further down.
+            Some(_) => Some(next_free),
+            // Nothing below: would create a new workspace past the last one.
+            None => allow_new_bottom.then_some(next_free),
+        }
+    }
+
+    /// Like [`Self::step_global_index_down`] but upward ("up", i.e. a lower number), never below 1.
+    /// `allow_new` permits creating a free lower slot when there is no workspace below on this
+    /// output.
+    fn step_global_index_up(
+        &self,
+        output: &Output,
+        current: usize,
+        allow_new: bool,
+    ) -> Option<usize> {
+        let monitor = self.monitor_for_output(output)?;
+        let prev_on_output = monitor
             .workspaces
             .iter()
             .filter_map(|ws| self.global_workspace_idxs.get(&ws.id()).copied())
             .filter(|idx| *idx < current)
-            .max()
+            .max();
+        let prev_free = self.largest_free_global_index_below(current);
+
+        match (prev_on_output, prev_free) {
+            // Whichever is closer to `current` (the larger index).
+            (Some(existing), Some(free)) => Some(existing.max(free)),
+            (Some(existing), None) => Some(existing),
+            // Only a free slot below: create it if allowed.
+            (None, Some(free)) => allow_new.then_some(free),
+            (None, None) => None,
+        }
+    }
+
+    fn previous_global_workspace_index_on_output(&mut self, output: &Output) -> Option<usize> {
+        // Going up is bounded by index 1, so always allow creating a lower slot (unlike going down,
+        // which is unbounded and must avoid spawning an endless chain of empty workspaces).
+        let current = self.workspace_global_index_on_output(output)?;
+        self.step_global_index_up(output, current, true)
     }
 
     fn next_global_workspace_index_on_output(&mut self, output: &Output) -> Option<usize> {
-        self.refresh_global_workspace_indices();
-
         let current = self.workspace_global_index_on_output(output)?;
-        let monitor = self.monitor_for_output(output)?;
-        let active_workspace = &monitor.workspaces[monitor.active_workspace_idx];
-
-        let next_existing = monitor
-            .workspaces
-            .iter()
-            .filter_map(|ws| self.global_workspace_idxs.get(&ws.id()).copied())
-            .filter(|idx| *idx > current)
-            .min();
-
-        next_existing.or_else(|| {
-            active_workspace
-                .has_windows_or_name()
-                .then(|| self.next_free_global_workspace_index_from(current + 1))
-        })
+        let allow_new = self.active_workspace_has_content_on_output(output);
+        self.step_global_index_down(output, current, allow_new)
     }
 
     fn next_global_workspace_index_on_output_for_move(&mut self, output: &Output) -> Option<usize> {
-        self.refresh_global_workspace_indices();
-
+        // Moving a window may always create the next slot.
         let current = self.workspace_global_index_on_output(output)?;
-        let monitor = self.monitor_for_output(output)?;
-
-        let next_existing = monitor
-            .workspaces
-            .iter()
-            .filter_map(|ws| self.global_workspace_idxs.get(&ws.id()).copied())
-            .filter(|idx| *idx > current)
-            .min();
-
-        Some(
-            next_existing
-                .unwrap_or_else(|| self.next_free_global_workspace_index_from(current + 1)),
-        )
+        self.step_global_index_down(output, current, true)
     }
 
     fn previous_global_workspace_index_on_output_for_move(
         &mut self,
         output: &Output,
     ) -> Option<usize> {
-        self.refresh_global_workspace_indices();
-
+        // Moving a window may always create the previous slot (still never below 1).
         let current = self.workspace_global_index_on_output(output)?;
-        let monitor = self.monitor_for_output(output)?;
-
-        let previous_existing = monitor
-            .workspaces
-            .iter()
-            .filter_map(|ws| self.global_workspace_idxs.get(&ws.id()).copied())
-            .filter(|idx| *idx < current)
-            .max();
-
-        previous_existing.or_else(|| self.previous_free_global_workspace_index_from(current))
+        self.step_global_index_up(output, current, true)
     }
 
     fn switch_workspace_to_global_index_on_output(&mut self, output: &Output, index: usize) {

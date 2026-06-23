@@ -2782,6 +2782,77 @@ fn global_workspace_indices_focus_lower_workspace_scrolls_up() {
 }
 
 #[test]
+fn global_workspace_indices_focus_up_reaches_free_lower_workspace() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output1 = monitors[0].output.clone();
+    layout.focus_output(&output1);
+
+    // Carry the window down to global index 3, leaving 1 and 2 free.
+    layout.move_to_workspace_down(true);
+    layout.move_to_workspace_down(true);
+
+    // Focusing up from the occupied workspace 3 should land on the free workspace 2 (the immediate
+    // lower slot, never below 1) rather than skipping it.
+    layout.focus_window_or_workspace_up();
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let monitor = &monitors[0];
+    let active_idx = monitor.active_workspace_idx;
+    assert_eq!(
+        layout.workspace_display_idx(monitor.workspaces[active_idx].id(), active_idx),
+        Some(2)
+    );
+
+    // Workspace 3 (holding window 1) must sit physically below the now-active workspace 2.
+    let ws3_pos = monitor
+        .workspaces
+        .iter()
+        .position(|ws| ws.has_window(&1))
+        .unwrap();
+    assert!(active_idx < ws3_pos);
+}
+
+#[test]
+fn global_workspace_indices_focus_up_from_empty_creates_lower_workspace() {
+    let ops = [Op::AddOutput(1)];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    // Go to an empty workspace 3.
+    let (_, index) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(3))
+        .unwrap();
+    layout.switch_workspace(index);
+
+    // Focusing up from the empty workspace 3 must still step down to a lower slot (2), not stall:
+    // up is bounded by index 1, so it isn't subject to the empty-workspace guard that down uses.
+    layout.focus_window_or_workspace_up();
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let monitor = &monitors[0];
+    let active_idx = monitor.active_workspace_idx;
+    assert_eq!(
+        layout.workspace_display_idx(monitor.workspaces[active_idx].id(), active_idx),
+        Some(2)
+    );
+}
+
+#[test]
 fn global_workspace_indices_move_workspace_down_reassigns_active_workspace_number() {
     let ops = [Op::AddOutput(1), Op::AddOutput(2)];
 
