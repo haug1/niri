@@ -689,6 +689,53 @@ impl OverviewProgress {
     }
 }
 
+/// Reorders one monitor's workspaces so that globally-indexed workspaces appear in ascending
+/// global index order, leaving un-indexed workspaces (e.g. the trailing empty one) in place.
+fn reorder_monitor_workspaces<W: LayoutElement>(
+    monitor: &mut Monitor<W>,
+    idxs: &HashMap<WorkspaceId, usize>,
+) {
+    let len = monitor.workspaces.len();
+
+    // Physical slots currently holding globally-indexed workspaces.
+    let slots: Vec<usize> = (0..len)
+        .filter(|&i| idxs.contains_key(&monitor.workspaces[i].id()))
+        .collect();
+
+    // The same slots, reordered by the global index of the workspace they should end up holding.
+    let mut sorted = slots.clone();
+    sorted.sort_by_key(|&i| idxs[&monitor.workspaces[i].id()]);
+
+    if slots == sorted {
+        return;
+    }
+
+    // Build a permutation: each indexed slot receives the workspace that belongs there in global
+    // index order; un-indexed slots map to themselves.
+    let mut order: Vec<usize> = (0..len).collect();
+    for (&slot, &src) in slots.iter().zip(sorted.iter()) {
+        order[slot] = src;
+    }
+
+    let active_id = monitor.workspaces[monitor.active_workspace_idx].id();
+
+    let mut taken: Vec<Option<Workspace<W>>> = monitor.workspaces.drain(..).map(Some).collect();
+    monitor.workspaces = order
+        .iter()
+        .map(|&src| taken[src].take().unwrap())
+        .collect();
+
+    monitor.active_workspace_idx = monitor
+        .workspaces
+        .iter()
+        .position(|ws| ws.id() == active_id)
+        .unwrap();
+
+    // The physical order changed, so an in-progress switch animation no longer maps to the right
+    // workspaces; snap it to avoid a corrupted scroll (mirrors `Monitor::move_workspace_to_idx`).
+    monitor.workspace_switch = None;
+}
+
 impl<W: LayoutElement> Layout<W> {
     fn global_workspace_indices_enabled(&self) -> bool {
         self.options.layout.global_workspace_indices
@@ -771,6 +818,25 @@ impl<W: LayoutElement> Layout<W> {
             let index = self.pick_global_workspace_index(preferred);
             self.global_workspace_idxs.insert(id, index);
         }
+
+        self.reorder_workspaces_by_global_index();
+    }
+
+    /// Reorders the workspaces on every monitor so their physical (vertical) order matches the
+    /// ascending global index order.
+    ///
+    /// The visual position of a workspace and the workspace-switch scroll direction are determined
+    /// purely by the physical index within `Monitor::workspaces`. Global indices are a logical
+    /// numbering layered on top, so without this the two can diverge (e.g. going to a freshly
+    /// created lower index lands it physically at the bottom). Keeping the physical order sorted is
+    /// what makes scrolling up/down agree with the numbering.
+    fn reorder_workspaces_by_global_index(&mut self) {
+        let idxs = &self.global_workspace_idxs;
+        if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
+            for mon in monitors.iter_mut() {
+                reorder_monitor_workspaces(mon, idxs);
+            }
+        }
     }
 
     fn find_workspace_by_global_index(
@@ -795,7 +861,7 @@ impl<W: LayoutElement> Layout<W> {
             return Some((output, workspace_idx));
         }
 
-        match &mut self.monitor_set {
+        let (output, id) = match &mut self.monitor_set {
             MonitorSet::Normal {
                 monitors,
                 active_monitor_idx,
@@ -825,7 +891,7 @@ impl<W: LayoutElement> Layout<W> {
                 let id = monitors[mon_idx].workspaces[target_idx].id();
                 self.global_workspace_idxs.insert(id, index);
 
-                Some((Some(monitors[mon_idx].output.clone()), target_idx))
+                (Some(monitors[mon_idx].output.clone()), id)
             }
             MonitorSet::NoOutputs { workspaces } => {
                 let target_idx = if let Some(idx) = workspaces.iter().position(|ws| {
@@ -843,9 +909,15 @@ impl<W: LayoutElement> Layout<W> {
                 let id = workspaces[target_idx].id();
                 self.global_workspace_idxs.insert(id, index);
 
-                Some((None, target_idx))
+                (None, id)
             }
-        }
+        };
+
+        // Place the freshly indexed workspace at its sorted physical position now, so that the
+        // caller's `activate` animates in the correct direction instead of scrolling to the bottom.
+        self.reorder_workspaces_by_global_index();
+        let workspace_idx = self.find_workspace_by_id(id)?.0;
+        Some((output, workspace_idx))
     }
 
     fn ensure_global_workspace_by_index_on_output(
@@ -888,7 +960,11 @@ impl<W: LayoutElement> Layout<W> {
         let id = monitor.workspaces[target_idx].id();
         self.global_workspace_idxs.insert(id, index);
 
-        Some(target_idx)
+        // Place the freshly indexed workspace at its sorted physical position now, so that the
+        // caller's `activate` animates in the correct direction instead of scrolling to the bottom.
+        self.reorder_workspaces_by_global_index();
+        let monitor = self.monitor_for_output(output)?;
+        monitor.workspaces.iter().position(|ws| ws.id() == id)
     }
 
     fn workspace_global_index_on_output(&mut self, output: &Output) -> Option<usize> {

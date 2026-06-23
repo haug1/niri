@@ -2731,6 +2731,57 @@ fn global_workspace_indices_move_window_up_returns_to_previous_existing_number()
 }
 
 #[test]
+fn global_workspace_indices_focus_lower_workspace_scrolls_up() {
+    let ops = [Op::AddOutput(1)];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    // Go to workspace 3 and put a window on it so it persists.
+    let (_, index) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(3))
+        .unwrap();
+    layout.switch_workspace(index);
+    let win = TestWindow::new(TestWindowParams::new(1));
+    layout.add_window(
+        win,
+        AddWindowTarget::Auto,
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::default(),
+    );
+
+    // Go to the lower workspace 1.
+    let (_, index) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(1))
+        .unwrap();
+    layout.switch_workspace(index);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let monitor = &monitors[0];
+    let active_idx = monitor.active_workspace_idx;
+
+    // Landed on workspace 1, which sits physically above workspace 3 (holding the window).
+    assert_eq!(
+        layout.workspace_display_idx(monitor.workspaces[active_idx].id(), active_idx),
+        Some(1)
+    );
+    let ws3_pos = monitor
+        .workspaces
+        .iter()
+        .position(|ws| ws.has_window(&1))
+        .unwrap();
+    assert!(active_idx < ws3_pos);
+
+    // The switch animates upward (towards a lower physical index), not down.
+    let switch = monitor.workspace_switch.as_ref().unwrap();
+    assert!(switch.target_idx() < switch.current_idx());
+}
+
+#[test]
 fn global_workspace_indices_move_workspace_down_reassigns_active_workspace_number() {
     let ops = [Op::AddOutput(1), Op::AddOutput(2)];
 
